@@ -1,80 +1,151 @@
 # haunt
 
-A small terminal multiplexer that runs inside your terminal and shows tabs
-as a tree in a sidebar on the left.
+A small terminal multiplexer that runs inside your terminal and shows your
+tabs as a tree in a sidebar on the left, with each tab's panes listed under it.
 
 ```
- ▾ tab 1               │➜  ~ vim                │➜  ~ htop
-   ├ vim               │                        │
-   └ htop              │                        │
- ▸ build               │                        │
- ctrl+shift+h: help    │                        │
+ ▾ dev                          │➜  ~ vim main.rs        │➜  ~ htop
+   ├ vim main.rs                │                        │
+   └ htop                       │                        │
+ ▸ logs                         │                        │
+ ▾ git                          │                        │
+   └ lazygit                    │                        │
+                                │                        │
+ ctrl+shift+h: help             │                        │
 ```
 
-## Build & run
+haunt is deliberately simple: there's no config file, no themes, and no
+detach/attach. Everything is a constant in the source, so change the code if
+you want different behavior.
+
+## Features
+
+- **Tree-style tab sidebar.** Fold and unfold tabs, click to switch, and long
+  names are cut off with "…".
+- **Splits.** Put panes side by side or stacked, and move between them.
+- **Real terminal emulation** via [alacritty_terminal](https://crates.io/crates/alacritty_terminal):
+  vim, htop, less and lazygit work, with truecolor, alternate screen, mouse
+  reporting and cursor shapes.
+- **Per-pane scrollback** (10,000 lines) with the mouse wheel.
+- **Mouse support.** Click tabs and panes in the sidebar, click a pane to
+  focus it, and scroll over any pane.
+- **Single-chord shortcuts** (Ctrl+Shift+…), with no prefix key to press first.
+- **Always restores your terminal** on exit, even if haunt crashes.
+
+## Requirements
+
+- **Rust 1.88 or newer** ([rustup.rs](https://rustup.rs)).
+- **macOS or Linux.** It has been tested on macOS. Linux should work, and
+  Windows isn't supported.
+- **A terminal that supports the
+  [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)**,
+  such as Ghostty, kitty, WezTerm, foot or Alacritty. haunt needs it to tell
+  Ctrl+Shift+T apart from Ctrl+T. In terminals without it, such as macOS
+  Terminal.app, the shortcuts won't work.
+
+## Install
 
 ```sh
-cargo build --release
-./target/release/haunt
-```
-
-To run `haunt` from anywhere, install it to `~/.cargo/bin`:
-
-```sh
+git clone https://github.com/alivanz/haunt.git
+cd haunt
 ./install.sh
 ```
 
-Run `./install.sh` again after changing the source; the installed binary
-doesn't update by itself.
+`install.sh` builds haunt and installs the `haunt` binary to `~/.cargo/bin`,
+which rustup normally adds to your `PATH`. Then run it from anywhere:
 
-`cargo test` runs the unit tests (layout math, sidebar tree/selection, key
-and mouse encoding).
+```sh
+haunt
+```
 
-## Keybindings
+If you've changed the source, run `./install.sh` again to install the new
+build. To try changes without installing, run `cargo run --release` in the
+repo instead.
 
-Every command is a single Ctrl+Shift chord.
+To uninstall, run `cargo uninstall haunt`.
 
-| Keys                   | Action                                   |
-|------------------------|------------------------------------------|
-| `Ctrl+Shift+T`         | new tab                                  |
-| `Ctrl+Shift+W`         | close focused pane (closes tab if last)  |
-| `Ctrl+Shift+\|`        | split: new pane to the right             |
-| `Ctrl+Shift+_`         | split: new pane below                    |
-| `Ctrl+Shift+↑/↓`      | previous/next tab                        |
-| `Ctrl+Shift+←/→`      | previous/next pane in this tab           |
-| `Ctrl+Shift+R`         | rename tab (Enter ok, Esc cancel, Ctrl+u clear) |
-| `Ctrl+Shift+S`         | focus sidebar (press again to leave)     |
-| `Ctrl+Shift+B`         | hide/show sidebar                        |
-| `Ctrl+Shift+H`         | show this list in a popup                |
-| `Ctrl+Shift+Q`         | quit                                     |
+## Usage
 
-These need a terminal that speaks the kitty keyboard protocol (Ghostty,
-kitty, WezTerm, foot...), which haunt switches on at startup; elsewhere
-Ctrl+Shift+T is indistinguishable from Ctrl+T. If a shortcut does nothing,
-check that Ghostty doesn't have its own keybind on it.
+haunt starts with one tab running your login shell. Press **Ctrl+Shift+H**
+at any time to see all the shortcuts.
 
-In the sidebar: `j`/`k` (or arrows) move, `Enter` switches to the selected
-tab/pane, `Space` folds/unfolds a tab, `Esc` goes back to the pane.
+| Keys             | Action                                           |
+|------------------|--------------------------------------------------|
+| `Ctrl+Shift+T`   | new tab                                          |
+| `Ctrl+Shift+W`   | close the focused pane (closes the tab if it's the last pane) |
+| `Ctrl+Shift+\|`  | split: new pane to the right                     |
+| `Ctrl+Shift+_`   | split: new pane below                            |
+| `Ctrl+Shift+↑/↓` | previous / next tab                              |
+| `Ctrl+Shift+←/→` | previous / next pane in the current tab          |
+| `Ctrl+Shift+R`   | rename the current tab (Enter saves, Esc cancels, Ctrl+U clears) |
+| `Ctrl+Shift+S`   | focus the sidebar (press again to leave)         |
+| `Ctrl+Shift+B`   | hide / show the sidebar                          |
+| `Ctrl+Shift+H`   | show the shortcuts popup                         |
+| `Ctrl+Shift+Q`   | quit                                             |
 
-Mouse: click a tab or pane in the sidebar to switch to it (click the `▸`/`▾`
-arrow to fold), click a pane to focus it, scroll the wheel over a pane to
-scroll its history. Programs that ask for the mouse (vim `mouse=a`, htop,
-lazygit) get mouse events directly. To select text with the terminal's
-native selection, hold Shift while dragging (in Ghostty).
+**In the sidebar:** `j`/`k` or the arrow keys move, `Enter` switches to the
+selected tab or pane, `Space` folds or unfolds a tab, and `Esc` returns to
+the panes.
 
-When a shell exits its pane closes; when the last pane closes, haunt exits.
+**Mouse:**
+- Click a tab or pane in the sidebar to switch to it, or click the `▸`/`▾`
+  arrow to fold the tab.
+- Click a pane to focus it.
+- Scroll over a pane to move through its history. A yellow `[n/total]` marker
+  shows how far back you are, and typing jumps back to the bottom.
+- Programs that use the mouse (vim with `mouse=a`, htop, lazygit) receive
+  clicks and scrolls directly.
+- To select text with your terminal's own selection, hold **Shift** while
+  dragging.
+
+When a shell exits, its pane closes. When the last pane closes, haunt exits.
+
+If a shortcut does nothing, your terminal probably has its own keybinding on
+that key. Remove that binding in the terminal's settings, or change the key
+in `src/input.rs`.
+
+## Customizing
+
+There's no config file. Edit the source and run `./install.sh` again.
+
+| What                    | Where                                               |
+|-------------------------|-----------------------------------------------------|
+| Shortcuts               | `shortcut()` in `src/input.rs`; also update the `HELP` list next to it |
+| Sidebar width           | `WIDTH` in `src/ui/sidebar.rs`                      |
+| Scrollback length       | `SCROLLBACK` in `src/pane.rs`                       |
+| Lines per scroll tick   | `SCROLL_LINES` in `src/app.rs`                      |
+| Sidebar colors          | `render()` in `src/ui/sidebar.rs`                   |
 
 ## Code map
 
-- `src/main.rs` – terminal setup/restore (also on panic)
-- `src/app.rs` – state (tabs, panes, modes) and the event loop
-- `src/layout.rs` – split tree and pane rectangles
-- `src/pane.rs` – PTY + shell + alacritty_terminal emulator per pane
-- `src/input.rs` – shortcuts (`shortcut()`); key/mouse → escape sequence encoding
-- `src/ui/sidebar.rs` – sidebar tree rows, selection, truncation, drawing
-- `src/ui/pane_view.rs` – draws an emulator grid into the ratatui buffer
-- `src/ui/help.rs` – the Ctrl+Shift+H popup (its text is `HELP` in `input.rs`)
-- `src/ui/mod.rs` – screen split and pane dividers
+- `src/main.rs`: sets up the outer terminal and restores it on exit and on panic
+- `src/app.rs`: app state (tabs, panes, modes) and the event loop
+- `src/layout.rs`: the split tree and pane rectangles
+- `src/pane.rs`: one PTY, shell and alacritty_terminal emulator per pane
+- `src/input.rs`: shortcuts, and turning keys and mouse events into escape sequences
+- `src/ui/sidebar.rs`: sidebar rows, selection, truncation and drawing
+- `src/ui/pane_view.rs`: draws a terminal grid into the ratatui buffer
+- `src/ui/help.rs`: the Ctrl+Shift+H popup
+- `src/ui/mod.rs`: splits the screen and draws pane dividers
 
-Defaults (sidebar width, scrollback size, colors, keys) are constants near the
-top of the relevant module.
+Run `cargo test` for the unit tests, which cover layout math, the sidebar
+tree and selection, and key/mouse encoding.
+
+## Known limitations
+
+- Splits are always 50/50 and can't be resized.
+- New panes start in the directory haunt was launched from.
+- Pane names come from the title the running program sets. Shells that
+  don't set one show "shell".
+- No copy mode. Use your terminal's Shift+drag selection.
+- Clipboard writes from programs (OSC 52) aren't passed to the outer terminal.
+
+## Built with
+
+[ratatui](https://ratatui.rs) · [crossterm](https://crates.io/crates/crossterm) ·
+[portable-pty](https://crates.io/crates/portable-pty) ·
+[alacritty_terminal](https://crates.io/crates/alacritty_terminal)
+
+## License
+
+[MIT](LICENSE)
