@@ -8,6 +8,8 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
+use crate::ui::pane_view::printable;
+
 /// Attribute flags that change how text looks (and so need SGR codes).
 const STYLE_FLAGS: Flags = Flags::BOLD
     .union(Flags::DIM)
@@ -75,7 +77,7 @@ pub fn to_ansi(grid: &Grid<Cell>) -> String {
                 push_sgr(&mut out, cell_pen);
                 pen = cell_pen;
             }
-            out.push(if cell.c == '\0' { ' ' } else { cell.c });
+            out.push(printable(cell.c));
             if let Some(zw) = cell.zerowidth() {
                 out.extend(zw);
             }
@@ -97,7 +99,7 @@ pub fn to_ansi(grid: &Grid<Cell>) -> String {
 }
 
 fn is_blank(cell: &Cell) -> bool {
-    (cell.c == ' ' || cell.c == '\0')
+    printable(cell.c) == ' '
         && cell.bg == Color::Named(NamedColor::Background)
         && !cell
             .flags
@@ -211,6 +213,12 @@ mod tests {
     fn includes_scrollback() {
         let t = term(10, 2, "one\r\ntwo\r\nthree\r\nfour");
         assert_eq!(to_ansi(t.grid()), "one\r\ntwo\r\nthree\r\nfour");
+    }
+
+    #[test]
+    fn tabs_become_spaces() {
+        let t = term(20, 2, "a\tb");
+        assert_eq!(to_ansi(t.grid()), format!("a{}b", " ".repeat(7)));
     }
 
     #[test]
