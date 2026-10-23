@@ -73,7 +73,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("Ctrl+Shift+S", "focus sidebar"),
     ("Ctrl+Shift+B", "hide/show sidebar"),
     ("Ctrl+Shift+H", "this help"),
-    ("Ctrl+Shift+Q", "quit"),
+    ("Ctrl+Shift+Q", "quit (a -s session is kept)"),
     ("", ""),
     ("sidebar", "j/k move, ⏎ go, ␣ fold, esc back"),
     ("mouse", "click to switch, wheel scrolls"),

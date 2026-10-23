@@ -1,8 +1,10 @@
 //! Application state and the main event loop.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
@@ -19,13 +21,39 @@ use ratatui::layout::{Position, Rect};
 
 use crate::input::{self, Action};
 use crate::layout::{self, Computed, Node, Split};
-use crate::pane::{Pane, PaneId, TermSize};
+use crate::pane::{Pane, PaneId, SpawnOptions, TermSize};
+use crate::session::{self, SavedPane, SavedTab, Session};
 use crate::ui::{self, sidebar};
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Lines moved per scroll wheel tick.
 const SCROLL_LINES: i32 = 3;
+
+/// How often a named session is saved while something changes. A crash
+/// loses at most this much.
+const SAVE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// A named session opened from the command line (`haunt -s NAME`).
+pub struct OpenSession {
+    pub name: String,
+    /// Held for as long as haunt runs.
+    pub lock: session::Lock,
+    /// What was saved last time, if anything.
+    pub saved: Option<Session>,
+}
+
+/// Autosave state for the open session.
+struct Saving {
+    name: String,
+    path: PathBuf,
+    _lock: session::Lock,
+    /// Something changed since the last save.
+    dirty: bool,
+    last_save: Instant,
+    /// The last save failed; shown in the sidebar.
+    failed: bool,
+}
 
 /// Everything the main loop reacts to. Input and PTY reader threads send
 /// these over one channel so the loop can block on a single receiver.
@@ -78,13 +106,14 @@ pub struct App {
     mouse_grab: Option<PaneId>,
     /// Cursor style last sent to the outer terminal.
     cursor_style: Option<CursorStyle>,
+    saving: Option<Saving>,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     quit: bool,
 }
 
 impl App {
-    pub fn new(screen: Rect) -> Result<App> {
+    pub fn new(screen: Rect, open: Option<OpenSession>) -> Result<App> {
         let (tx, rx) = channel();
         let (sidebar_area, main_area) = ui::screen_areas(screen, true);
         let mut app = App {
@@ -101,11 +130,27 @@ impl App {
             computed: Computed::default(),
             mouse_grab: None,
             cursor_style: None,
+            saving: None,
             tx,
             rx,
             quit: false,
         };
-        app.new_tab()?;
+        if let Some(open) = open {
+            if let Some(saved) = open.saved {
+                app.restore(saved);
+            }
+            app.saving = Some(Saving {
+                path: session::path(&open.name),
+                name: open.name,
+                _lock: open.lock,
+                dirty: false,
+                last_save: Instant::now(),
+                failed: false,
+            });
+        }
+        if app.tabs.is_empty() {
+            app.new_tab()?;
+        }
         Ok(app)
     }
 
@@ -115,15 +160,131 @@ impl App {
             terminal.draw(|f| self.draw(f))?;
             self.sync_cursor_style(terminal);
 
-            // Block for one event, then drain whatever else is queued so a
-            // burst of output causes one redraw, not hundreds.
-            let ev = self.rx.recv()?;
-            self.handle(ev);
-            while let Ok(ev) = self.rx.try_recv() {
-                self.handle(ev);
+            // Wait for one event, then drain whatever else is queued so a
+            // burst of output causes one redraw, not hundreds. The timeout
+            // lets a pending autosave happen even when nothing else does.
+            match self.rx.recv_timeout(SAVE_INTERVAL) {
+                Ok(ev) => {
+                    self.handle(ev);
+                    while let Ok(ev) = self.rx.try_recv() {
+                        self.handle(ev);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
+            self.autosave();
         }
+        self.finish_session();
         Ok(())
+    }
+
+    // ---- sessions -----------------------------------------------------
+
+    /// Recreate the tabs of a saved session: same layout, names and pane
+    /// text, with a fresh shell in each pane's old directory.
+    fn restore(&mut self, saved: Session) {
+        for tab in saved.tabs {
+            let mut panes: HashMap<PaneId, SavedPane> =
+                tab.panes.into_iter().map(|p| (p.id, p)).collect();
+            let mut layout = Some(tab.layout.clone());
+            for (id, rect) in tab.layout.compute(self.main_area).panes {
+                let saved = panes.remove(&id);
+                let (cwd, title, history) = match saved {
+                    Some(p) => (p.cwd, p.title, Some(p.history)),
+                    None => (None, None, None),
+                };
+                let size = TermSize {
+                    cols: rect.width,
+                    rows: rect.height,
+                };
+                match Pane::spawn(id, size, self.tx.clone(), SpawnOptions { cwd, history }) {
+                    Ok(mut pane) => {
+                        pane.title = title;
+                        self.panes.insert(id, pane);
+                    }
+                    Err(_) => layout = layout.and_then(|l| l.remove(id)),
+                }
+                self.next_pane_id = self.next_pane_id.max(id + 1);
+            }
+            let Some(layout) = layout else { continue };
+            let ids = layout.panes();
+            let focused = if ids.contains(&tab.focused) {
+                tab.focused
+            } else {
+                ids[0]
+            };
+            self.tabs.push(Tab {
+                name: tab.name,
+                layout,
+                focused,
+                collapsed: tab.collapsed,
+            });
+        }
+        self.tabs_created = self.tabs.len();
+        self.active = saved.active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    fn snapshot_session(&self) -> Session {
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| SavedTab {
+                name: tab.name.clone(),
+                collapsed: tab.collapsed,
+                focused: tab.focused,
+                layout: tab.layout.clone(),
+                panes: tab
+                    .layout
+                    .panes()
+                    .into_iter()
+                    .filter_map(|id| {
+                        let pane = self.panes.get(&id)?;
+                        Some(SavedPane {
+                            id,
+                            cwd: pane.cwd(),
+                            title: pane.title.clone(),
+                            history: pane.history(),
+                        })
+                    })
+                    .collect(),
+            })
+            .collect();
+        Session::new(self.active, tabs)
+    }
+
+    fn save_session(&mut self) {
+        if self.saving.is_none() {
+            return;
+        }
+        let snapshot = self.snapshot_session();
+        let Some(saving) = &mut self.saving else {
+            return;
+        };
+        saving.failed = session::save(&saving.path, &snapshot).is_err();
+        saving.dirty = false;
+        saving.last_save = Instant::now();
+    }
+
+    fn autosave(&mut self) {
+        if let Some(s) = &self.saving
+            && s.dirty
+            && s.last_save.elapsed() >= SAVE_INTERVAL
+        {
+            self.save_session();
+        }
+    }
+
+    /// On exit: quitting saves the session so it can be resumed; if every
+    /// shell exited instead, the session is over and its file is removed.
+    fn finish_session(&mut self) {
+        if self.tabs.is_empty() {
+            if let Some(s) = &self.saving {
+                session::delete(&s.path);
+            }
+        } else {
+            self.save_session();
+        }
     }
 
     // ---- drawing ------------------------------------------------------
@@ -176,10 +337,12 @@ impl App {
     fn draw_sidebar(&self, f: &mut Frame) -> Option<Position> {
         let entries = self.sidebar_entries();
         let rows = sidebar::rows(&entries);
-        let (status, highlight) = match self.mode {
-            Mode::Normal | Mode::Help => (" ctrl+shift+h: help", false),
-            Mode::Sidebar => (" SIDEBAR ⏎ go ␣ fold", true),
-            Mode::Rename(_) => (" RENAME ⏎ ok esc", true),
+        let (status, highlight) = match (&self.mode, &self.saving) {
+            (Mode::Sidebar, _) => (" SIDEBAR ⏎ go ␣ fold".to_string(), true),
+            (Mode::Rename(_), _) => (" RENAME ⏎ ok esc".to_string(), true),
+            (_, Some(s)) if s.failed => (" ⚠ saving session failed".to_string(), true),
+            (_, Some(s)) => (format!(" [{}] ctrl+shift+h: help", s.name), false),
+            (_, None) => (" ctrl+shift+h: help".to_string(), false),
         };
         let view = sidebar::View {
             tabs: &entries,
@@ -190,7 +353,7 @@ impl App {
                 _ => None,
             },
             status: sidebar::Status {
-                text: status,
+                text: &status,
                 highlight,
             },
         };
@@ -264,6 +427,14 @@ impl App {
     // ---- events -------------------------------------------------------
 
     fn handle(&mut self, ev: AppEvent) {
+        // Anything but pointer movement may change what's worth saving.
+        let moved =
+            matches!(&ev, AppEvent::Input(Event::Mouse(m)) if m.kind == MouseEventKind::Moved);
+        if let Some(s) = &mut self.saving
+            && !moved
+        {
+            s.dirty = true;
+        }
         match ev {
             AppEvent::Input(Event::Key(key)) if key.kind != KeyEventKind::Release => {
                 self.on_key(key)
@@ -537,7 +708,7 @@ impl App {
             cols: rect.width,
             rows: rect.height,
         };
-        let pane = Pane::spawn(id, size, self.tx.clone())?;
+        let pane = Pane::spawn(id, size, self.tx.clone(), SpawnOptions::default())?;
         self.panes.insert(id, pane);
         Ok(id)
     }

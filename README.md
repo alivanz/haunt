@@ -16,7 +16,8 @@ tabs as a tree in a sidebar on the left, with each tab's panes listed under it.
 
 haunt is deliberately simple: there's no config file, no themes, and no
 detach/attach. Everything is a constant in the source, so change the code if
-you want different behavior.
+you want different behavior. It can save named sessions, so your tabs and
+their text survive a restart or a crash.
 
 ## Features
 
@@ -30,6 +31,8 @@ you want different behavior.
 - **Mouse support.** Click tabs and panes in the sidebar, click a pane to
   focus it, and scroll over any pane.
 - **Single-chord shortcuts** (Ctrl+Shift+…), with no prefix key to press first.
+- **Optional saved sessions.** `haunt -s work` brings back your tabs, splits,
+  folders and pane text after you quit, or after a crash.
 - **Always restores your terminal** on exit, even if haunt crashes.
 
 ## Requirements
@@ -104,6 +107,38 @@ If a shortcut does nothing, your terminal probably has its own keybinding on
 that key. Remove that binding in the terminal's settings, or change the key
 in `src/input.rs`.
 
+## Sessions
+
+Start haunt with a session name to have it saved:
+
+```sh
+haunt -s work      # restore "work" if it was saved, and keep saving it
+haunt --sessions   # list saved sessions
+haunt              # no session: nothing is saved
+```
+
+While a session is open, haunt saves it every 3 seconds while anything
+changes, so a crash or power loss costs at most a few seconds. The sidebar
+shows `[work]` at the bottom.
+
+When you start the session again, you get back:
+- every tab, with its name, splits and folded state
+- each pane's text and scrollback, with colors, followed by a `── restored ──` line
+- a fresh shell in each pane, in the folder it was in
+
+Programs that were running, such as vim or a server, aren't restarted; only
+their text is kept. If vim or another full-screen program was open, you get
+back the shell text from before it started.
+
+- `Ctrl+Shift+Q` quits and keeps the session for next time.
+- Exiting every shell (typing `exit` in the last pane) ends the session and
+  deletes it.
+- A session can only be open in one haunt at a time.
+
+Sessions are stored in `~/.local/state/haunt/sessions/` (or
+`$XDG_STATE_HOME/haunt/sessions/`), one `NAME.json` file each. To delete one,
+remove its file.
+
 ## Customizing
 
 There's no config file. Edit the source and run `./install.sh` again.
@@ -114,12 +149,15 @@ There's no config file. Edit the source and run `./install.sh` again.
 | Sidebar width           | `WIDTH` in `src/ui/sidebar.rs`                      |
 | Scrollback length       | `SCROLLBACK` in `src/pane.rs`                       |
 | Lines per scroll tick   | `SCROLL_LINES` in `src/app.rs`                      |
+| Session save interval   | `SAVE_INTERVAL` in `src/app.rs`                     |
 | Sidebar colors          | `render()` in `src/ui/sidebar.rs`                   |
 
 ## Code map
 
-- `src/main.rs`: sets up the outer terminal and restores it on exit and on panic
-- `src/app.rs`: app state (tabs, panes, modes) and the event loop
+- `src/main.rs`: command-line options; sets up the outer terminal and restores it on exit and on panic
+- `src/app.rs`: app state (tabs, panes, modes), the event loop, and session restore and autosave
+- `src/session.rs`: the session file format, saving, listing and locking
+- `src/snapshot.rs`: turns a pane's text into colored text for saving
 - `src/layout.rs`: the split tree and pane rectangles
 - `src/pane.rs`: one PTY, shell and alacritty_terminal emulator per pane
 - `src/input.rs`: shortcuts, and turning keys and mouse events into escape sequences
@@ -129,16 +167,18 @@ There's no config file. Edit the source and run `./install.sh` again.
 - `src/ui/mod.rs`: splits the screen and draws pane dividers
 
 Run `cargo test` for the unit tests, which cover layout math, the sidebar
-tree and selection, and key/mouse encoding.
+tree and selection, key/mouse encoding, and saving/restoring sessions.
 
 ## Known limitations
 
-- Splits are always 50/50 and can't be resized.
+- Panes split in the same direction always share the space evenly; they
+  can't be resized.
 - New panes start in the directory haunt was launched from.
 - Pane names come from the title the running program sets. Shells that
   don't set one show "shell".
 - No copy mode. Use your terminal's Shift+drag selection.
 - Clipboard writes from programs (OSC 52) aren't passed to the outer terminal.
+- Restored sessions bring back text, not running programs.
 
 ## Built with
 
