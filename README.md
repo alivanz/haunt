@@ -3,16 +3,7 @@
 A small terminal multiplexer that runs inside your terminal and shows your
 tabs as a tree in a sidebar on the left, with each tab's panes listed under it.
 
-```
- ▾ dev                          │➜  ~ vim main.rs        │➜  ~ htop
-   ├ vim main.rs                │                        │
-   └ htop                       │                        │
- ▸ logs                         │                        │
- ▾ git                          │                        │
-   └ lazygit                    │                        │
-                                │                        │
- ctrl+shift+h: help             │                        │
-```
+![haunt demo](docs/demo.gif)
 
 haunt is deliberately simple: there's no config file, no themes, and no
 detach/attach. Everything is a constant in the source, so change the code if
