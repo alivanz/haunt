@@ -96,7 +96,8 @@ the panes.
 - To select text with your terminal's own selection, hold **Shift** while
   dragging.
 
-When a shell exits, its pane closes. When the last pane closes, haunt exits.
+When a shell exits, its pane closes. When the last pane closes, haunt exits
+(for a session, the session ends).
 
 If a shortcut does nothing, your terminal probably has its own keybinding on
 that key. Remove that binding in the terminal's settings, or change the key
@@ -184,7 +185,8 @@ client/server messages.
 
 - Panes split in the same direction always share the space evenly; they
   can't be resized.
-- New panes start in the directory haunt was launched from.
+- New panes start in the directory haunt was launched from. For a session,
+  that's where it was first started, not where you attach from.
 - Pane names come from the title the running program sets. Shells that
   don't set one show "shell".
 - No copy mode. Use your terminal's Shift+drag selection.
