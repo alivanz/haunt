@@ -23,13 +23,15 @@ pub enum Action {
     /// Cycle through the current tab's panes (Ctrl+Shift+Left/Right).
     PrevPane,
     NextPane,
+    /// Leave a `haunt attach` session running in the background.
+    Detach,
     Quit,
 }
 
 /// Map a Ctrl+Shift+<key> press to a command.
 ///
 /// Telling Ctrl+Shift+T apart from Ctrl+T needs the kitty keyboard protocol,
-/// which `main.rs` turns on. The terminal then reports the unshifted key with
+/// which `tty::setup` turns on. The terminal then reports the unshifted key with
 /// the Shift modifier (`t`, `\`, `-`); the shifted forms (`T`, `|`, `_`)
 /// are accepted too in case a terminal sends those instead.
 pub fn shortcut(key: &KeyEvent) -> Option<Action> {
@@ -56,6 +58,7 @@ pub fn shortcut(key: &KeyEvent) -> Option<Action> {
         'r' => Action::RenameTab,
         's' => Action::FocusSidebar,
         'b' => Action::ToggleSidebar,
+        'd' => Action::Detach,
         'q' => Action::Quit,
         _ => return None,
     })
@@ -73,7 +76,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("Ctrl+Shift+S", "focus sidebar"),
     ("Ctrl+Shift+B", "hide/show sidebar"),
     ("Ctrl+Shift+H", "this help"),
-    ("Ctrl+Shift+Q", "quit (a -s session is kept)"),
+    ("Ctrl+Shift+D", "detach (attached sessions)"),
+    ("Ctrl+Shift+Q", "quit (a session is saved)"),
     ("", ""),
     ("sidebar", "j/k move, ⏎ go, ␣ fold, esc back"),
     ("mouse", "click to switch, wheel scrolls"),

@@ -1,12 +1,14 @@
-//! Named sessions (`haunt -s NAME`): the tabs, layout and pane text saved to
+//! Named sessions (`haunt attach NAME`): the tabs, layout and pane text saved to
 //! disk so they can be restored after haunt exits or the machine crashes.
 //!
 //! Files live in `$XDG_STATE_HOME/haunt/sessions` (default
-//! `~/.local/state/haunt/sessions`): `NAME.json` holds the session, and
-//! `NAME.lock` holds the pid of the haunt that has it open.
+//! `~/.local/state/haunt/sessions`): `NAME.json` holds the session,
+//! `NAME.lock` holds the pid of the server running it, and `NAME.log` gets
+//! that server's error output. The server's socket is in `runtime_dir()`.
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -81,6 +83,40 @@ pub fn path(name: &str) -> PathBuf {
     dir().join(format!("{name}.json"))
 }
 
+pub fn log_path(name: &str) -> PathBuf {
+    dir().join(format!("{name}.log"))
+}
+
+/// Where running sessions' sockets live: `$XDG_RUNTIME_DIR/haunt`, or
+/// `/tmp/haunt-UID` like tmux. Kept short because socket paths are limited
+/// to about 100 bytes, and cleared on reboot along with the servers.
+pub fn runtime_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("haunt"),
+        None => PathBuf::from(format!("/tmp/haunt-{}", unsafe { libc::getuid() })),
+    }
+}
+
+/// Create `runtime_dir()` if needed, and make sure only we can use it:
+/// anyone who can reach a session's socket can type into its shells.
+pub fn private_runtime_dir() -> Result<PathBuf> {
+    let dir = runtime_dir();
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // symlink_metadata: refuse a symlink someone planted in /tmp.
+    let meta = fs::symlink_metadata(&dir)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::getuid() } {
+        bail!("{} is not a directory owned by you", dir.display());
+    }
+    if meta.mode() & 0o077 != 0 {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+pub fn socket_path(name: &str) -> PathBuf {
+    runtime_dir().join(format!("{name}.sock"))
+}
+
 /// Load a saved session; `Ok(None)` if there isn't one yet.
 pub fn load(path: &Path) -> Result<Option<Session>> {
     let data = match fs::read(path) {
@@ -121,28 +157,53 @@ pub fn delete(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-/// Saved sessions, most recently saved first.
-pub fn list() -> Vec<(String, SystemTime)> {
+pub struct Listed {
+    pub name: String,
+    /// Pid of the server, if the session is running.
+    pub running: Option<i32>,
+    /// When it was last saved, if it has been.
+    pub saved: Option<SystemTime>,
+}
+
+/// Running and saved sessions: running first, then most recently saved.
+pub fn list() -> Vec<Listed> {
     let Ok(entries) = fs::read_dir(dir()) else {
         return Vec::new();
     };
-    let mut out: Vec<(String, SystemTime)> = entries
+    let mut names: Vec<String> = entries
         .flatten()
         .filter_map(|e| {
             let path = e.path();
-            if path.extension()? != "json" {
+            let ext = path.extension()?;
+            if ext != "json" && ext != "lock" {
                 return None;
             }
-            let name = path.file_stem()?.to_str()?.to_string();
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((name, modified))
+            Some(path.file_stem()?.to_str()?.to_string())
         })
         .collect();
-    out.sort_by_key(|s| std::cmp::Reverse(s.1));
+    names.sort();
+    names.dedup();
+    let mut out: Vec<Listed> = names
+        .into_iter()
+        .map(|name| Listed {
+            running: running(&name),
+            saved: fs::metadata(path(&name)).and_then(|m| m.modified()).ok(),
+            name,
+        })
+        .filter(|l| l.running.is_some() || l.saved.is_some())
+        .collect();
+    out.sort_by_key(|l| (l.running.is_none(), std::cmp::Reverse(l.saved)));
     out
 }
 
-/// "5m ago"-style age for `--sessions`.
+/// The pid of the server running session `name`, if there is one.
+pub fn running(name: &str) -> Option<i32> {
+    let text = fs::read_to_string(dir().join(format!("{name}.lock"))).ok()?;
+    let pid = text.trim().parse::<i32>().ok()?;
+    process_alive(pid).then_some(pid)
+}
+
+/// "5m ago"-style age for `haunt ls`.
 pub fn age(time: SystemTime) -> String {
     let secs = time.elapsed().map(|d| d.as_secs()).unwrap_or(0);
     match secs {
@@ -153,8 +214,8 @@ pub fn age(time: SystemTime) -> String {
     }
 }
 
-/// Held while a session is open, so two haunts can't overwrite each other's
-/// saves. A lock left behind by a crash is ignored because its pid is dead.
+/// Held by a session's server, so two servers can't run (and save) the same
+/// session. A lock left behind by a crash is ignored because its pid is dead.
 pub struct Lock {
     path: PathBuf,
 }
@@ -162,12 +223,10 @@ pub struct Lock {
 impl Lock {
     pub fn acquire(name: &str) -> Result<Lock> {
         let path = dir().join(format!("{name}.lock"));
-        if let Ok(text) = fs::read_to_string(&path)
-            && let Ok(pid) = text.trim().parse::<i32>()
+        if let Some(pid) = running(name)
             && pid != std::process::id() as i32
-            && process_alive(pid)
         {
-            bail!("session '{name}' is already open in another haunt (pid {pid})");
+            bail!("session '{name}' is already running (pid {pid})");
         }
         fs::create_dir_all(dir())?;
         fs::write(&path, std::process::id().to_string())?;

@@ -1,74 +1,68 @@
 mod app;
+mod client;
 mod input;
 mod layout;
 mod pane;
+mod protocol;
+mod screen;
+mod server;
 mod session;
 mod snapshot;
+mod tty;
 mod ui;
 
-use std::io::{Write, stdout};
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use anyhow::Result;
-use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use crossterm::{cursor, execute};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Size;
+
+use crate::app::{App, Output};
 
 const USAGE: &str = "\
-usage: haunt [-s NAME]
+usage: haunt [COMMAND]
 
-  -s, --session NAME   restore session NAME if it was saved, and keep saving it
-      --sessions       list saved sessions
-  -h, --help           show this help";
+  haunt               start haunt; nothing is kept once it closes
+  haunt attach NAME   show session NAME, starting it if needed (short: a)
+  haunt ls            list running and saved sessions
+  haunt kill NAME     stop session NAME and delete its saved copy
+  haunt help          show this help
+
+A session keeps running in the background: Ctrl+Shift+D detaches from it,
+and closing the terminal does too. Ctrl+Shift+Q stops it, saving its tabs
+and text for the next attach.";
 
 #[derive(Debug, PartialEq)]
 enum Command {
-    /// Start haunt, optionally with a named session.
-    Run(Option<String>),
-    ListSessions,
+    /// Plain `haunt`, running in this terminal.
+    Run,
+    Attach(String),
+    List,
+    Kill(String),
+    /// The background server for a session; started by `attach`.
+    Server(String),
     Help,
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
-    let mut session = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-s" | "--session" => {
-                let name = args.next().ok_or("-s needs a session name")?;
-                if !session::valid_name(&name) {
-                    return Err(format!(
-                        "invalid session name '{name}' (use letters, digits, '-', '_', '.')"
-                    ));
-                }
-                session = Some(name);
-            }
-            "--sessions" => return Ok(Command::ListSessions),
-            "-h" | "--help" => return Ok(Command::Help),
-            other => return Err(format!("unknown argument '{other}'")),
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Command, String> {
+    let args: Vec<String> = args.collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let name = |name: &str| {
+        if session::valid_name(name) {
+            Ok(name.to_string())
+        } else {
+            Err(format!(
+                "invalid session name '{name}' (use letters, digits, '-', '_', '.')"
+            ))
         }
-    }
-    Ok(Command::Run(session))
-}
-
-fn list_sessions() {
-    let sessions = session::list();
-    if sessions.is_empty() {
-        println!("No saved sessions. Start one with: haunt -s NAME");
-        return;
-    }
-    let width = sessions.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-    for (name, saved) in sessions {
-        println!("{name:<width$}  saved {}", session::age(saved));
-    }
-    println!("\n(stored in {})", session::dir().display());
+    };
+    Ok(match args.as_slice() {
+        [] => Command::Run,
+        ["attach" | "a", n] => Command::Attach(name(n)?),
+        ["ls" | "list"] => Command::List,
+        ["kill", n] => Command::Kill(name(n)?),
+        ["__server", n] => Command::Server(name(n)?),
+        ["help" | "-h" | "--help"] => Command::Help,
+        [cmd @ ("attach" | "a" | "kill")] => return Err(format!("{cmd} needs a session name")),
+        _ => return Err(format!("unknown command '{}'", args.join(" "))),
+    })
 }
 
 fn main() -> Result<()> {
@@ -76,87 +70,46 @@ fn main() -> Result<()> {
         eprintln!("haunt: {msg}\n\n{USAGE}");
         std::process::exit(2);
     });
-    // Everything that can fail with a message happens before the terminal
-    // switches to the UI, so errors print normally.
-    let open = match command {
+    match command {
+        Command::Run => run_here(),
+        Command::Attach(name) => client::attach(&name),
+        Command::List => {
+            list_sessions();
+            Ok(())
+        }
+        Command::Kill(name) => client::kill(&name),
+        Command::Server(name) => server::run(name),
         Command::Help => {
             println!("{USAGE}");
-            return Ok(());
+            Ok(())
         }
-        Command::ListSessions => {
-            list_sessions();
-            return Ok(());
-        }
-        Command::Run(None) => None,
-        Command::Run(Some(name)) => {
-            let lock = session::Lock::acquire(&name)?;
-            let saved = session::load(&session::path(&name))?;
-            Some(app::OpenSession { name, lock, saved })
-        }
-    };
-
-    // Restore the outer terminal before the panic message is printed, so
-    // it's readable and the shell isn't left in raw mode. Exit right away
-    // too: a panic in a PTY reader thread would otherwise leave the UI
-    // running on a terminal we just restored.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        default_hook(info);
-        std::process::exit(101);
-    }));
-
-    setup_terminal()?;
-    // Restores on normal return and on `?` errors (and on unwinding panics).
-    let _guard = RestoreGuard;
-
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    let size = terminal.size()?;
-    let screen = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-    app::App::new(screen, open)?.run(&mut terminal)
+    }
 }
 
-fn setup_terminal() -> Result<()> {
-    enable_raw_mode()?;
-    execute!(
-        stdout(),
-        EnterAlternateScreen,
-        // Kitty keyboard protocol, so Ctrl+Shift+T arrives as something
-        // different from Ctrl+T. Pushed after entering the alternate screen,
-        // since the terminal keeps a separate flag stack per screen.
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
-    Ok(())
+/// Plain `haunt`: everything in this process, drawn on this terminal.
+fn run_here() -> Result<()> {
+    // Anything that can fail with a message happens before the terminal
+    // switches to the UI, so errors print normally.
+    let (cols, rows) = crossterm::terminal::size()?;
+    let app = App::new(Size::new(cols, rows), Output::Local, None)?;
+    let _restore = tty::setup()?;
+    app.run()
 }
 
-/// Undo everything `setup_terminal` and the app did. Runs at most once, so
-/// the keyboard flag stack isn't popped twice.
-fn restore_terminal() {
-    static RESTORED: AtomicBool = AtomicBool::new(false);
-    if RESTORED.swap(true, Ordering::SeqCst) {
+fn list_sessions() {
+    let sessions = session::list();
+    if sessions.is_empty() {
+        println!("No sessions. Start one with: haunt attach NAME");
         return;
     }
-    let mut out = stdout();
-    let _ = execute!(
-        out,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        PopKeyboardEnhancementFlags,
-        SetCursorStyle::DefaultUserShape,
-        cursor::Show,
-        LeaveAlternateScreen
-    );
-    let _ = disable_raw_mode();
-    let _ = out.flush();
-}
-
-struct RestoreGuard;
-
-impl Drop for RestoreGuard {
-    fn drop(&mut self) {
-        restore_terminal();
+    let width = sessions.iter().map(|s| s.name.len()).max().unwrap_or(0);
+    for s in sessions {
+        let state = match (s.running, s.saved) {
+            (Some(pid), _) => format!("running (pid {pid})"),
+            (None, Some(saved)) => format!("saved {}", session::age(saved)),
+            (None, None) => continue,
+        };
+        println!("{:<width$}  {state}", s.name);
     }
 }
 
@@ -170,19 +123,19 @@ mod tests {
 
     #[test]
     fn arguments() {
-        assert_eq!(parse(&[]), Ok(Command::Run(None)));
+        assert_eq!(parse(&[]), Ok(Command::Run));
         assert_eq!(
-            parse(&["-s", "work"]),
-            Ok(Command::Run(Some("work".into())))
+            parse(&["attach", "work"]),
+            Ok(Command::Attach("work".into()))
         );
-        assert_eq!(
-            parse(&["--session", "a.b"]),
-            Ok(Command::Run(Some("a.b".into())))
-        );
-        assert_eq!(parse(&["--sessions"]), Ok(Command::ListSessions));
+        assert_eq!(parse(&["a", "a.b"]), Ok(Command::Attach("a.b".into())));
+        assert_eq!(parse(&["ls"]), Ok(Command::List));
+        assert_eq!(parse(&["kill", "work"]), Ok(Command::Kill("work".into())));
+        assert_eq!(parse(&["__server", "x"]), Ok(Command::Server("x".into())));
         assert_eq!(parse(&["-h"]), Ok(Command::Help));
-        assert!(parse(&["-s"]).is_err());
-        assert!(parse(&["-s", "../x"]).is_err());
+        assert!(parse(&["attach"]).is_err());
+        assert!(parse(&["attach", "../x"]).is_err());
+        assert!(parse(&["attach", "a", "b"]).is_err());
         assert!(parse(&["--nope"]).is_err());
     }
 }

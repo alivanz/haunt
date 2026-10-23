@@ -1,6 +1,8 @@
 //! Application state and the main event loop.
 
 use std::collections::HashMap;
+use std::io::{Write, stdout};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
@@ -16,16 +18,15 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use ratatui::Frame;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Position, Rect, Size};
 
 use crate::input::{self, Action};
 use crate::layout::{self, Computed, Node, Split};
 use crate::pane::{Pane, PaneId, SpawnOptions, TermSize};
+use crate::screen::{Screen, Terminal};
+use crate::server::Client;
 use crate::session::{self, SavedPane, SavedTab, Session};
 use crate::ui::{self, sidebar};
-
-pub type Terminal = ratatui::Terminal<CrosstermBackend<std::io::Stdout>>;
 
 /// Lines moved per scroll wheel tick.
 const SCROLL_LINES: i32 = 3;
@@ -34,10 +35,10 @@ const SCROLL_LINES: i32 = 3;
 /// loses at most this much.
 const SAVE_INTERVAL: Duration = Duration::from_secs(3);
 
-/// A named session opened from the command line (`haunt -s NAME`).
+/// A named session, run by a server (`haunt attach NAME`).
 pub struct OpenSession {
     pub name: String,
-    /// Held for as long as haunt runs.
+    /// Held for as long as the server runs.
     pub lock: session::Lock,
     /// What was saved last time, if anything.
     pub saved: Option<Session>,
@@ -55,15 +56,33 @@ struct Saving {
     failed: bool,
 }
 
-/// Everything the main loop reacts to. Input and PTY reader threads send
-/// these over one channel so the loop can block on a single receiver.
+/// Everything the main loop reacts to. Input, PTY reader and client threads
+/// send these over one channel so the loop can block on a single receiver.
 pub enum AppEvent {
+    /// From the terminal haunt shows on (including resizes).
     Input(Event),
     /// Some pane produced output; redraw.
     PaneOutput,
     PaneExited(PaneId),
     /// A program set (or reset) its pane's title.
     Title(PaneId, Option<String>),
+    /// A client wants to show this session; it replaces any other.
+    Attach(Client),
+    /// Input from the client with this id.
+    ClientInput(u64, Event),
+    /// The client with this id disconnected.
+    ClientGone(u64),
+    /// `haunt kill`: end the session and delete its saved copy. The stream
+    /// is closed when the server exits, which tells `kill` it's done.
+    Kill(UnixStream),
+}
+
+/// Where drawn frames go.
+pub enum Output {
+    /// The terminal haunt runs in (plain `haunt`).
+    Local,
+    /// A session server: the attached client, if any.
+    Server(Option<Client>),
 }
 
 pub struct Tab {
@@ -107,14 +126,22 @@ pub struct App {
     /// Cursor style last sent to the outer terminal.
     cursor_style: Option<CursorStyle>,
     saving: Option<Saving>,
+    output: Output,
+    /// Size of the terminal we draw on.
+    size: Size,
+    /// Repaint the whole screen next time (new client, or frames dropped).
+    redraw_all: bool,
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     quit: bool,
+    /// Ended by `haunt kill`; held until exit.
+    killed: Option<UnixStream>,
 }
 
 impl App {
-    pub fn new(screen: Rect, open: Option<OpenSession>) -> Result<App> {
+    pub fn new(size: Size, output: Output, open: Option<OpenSession>) -> Result<App> {
         let (tx, rx) = channel();
+        let screen = Rect::new(0, 0, size.width, size.height);
         let (sidebar_area, main_area) = ui::screen_areas(screen, true);
         let mut app = App {
             tabs: Vec::new(),
@@ -131,9 +158,13 @@ impl App {
             mouse_grab: None,
             cursor_style: None,
             saving: None,
+            output,
+            size,
+            redraw_all: false,
             tx,
             rx,
             quit: false,
+            killed: None,
         };
         if let Some(open) = open {
             if let Some(saved) = open.saved {
@@ -154,11 +185,18 @@ impl App {
         Ok(app)
     }
 
-    pub fn run(mut self, terminal: &mut Terminal) -> Result<()> {
-        spawn_input_thread(self.tx.clone());
+    /// For threads that feed the main loop (the server's client threads).
+    pub fn sender(&self) -> Sender<AppEvent> {
+        self.tx.clone()
+    }
+
+    pub fn run(mut self) -> Result<()> {
+        if matches!(self.output, Output::Local) {
+            spawn_input_thread(self.tx.clone());
+        }
+        let mut terminal = Terminal::new(Screen::new(self.size))?;
         while !self.quit {
-            terminal.draw(|f| self.draw(f))?;
-            self.sync_cursor_style(terminal);
+            self.render(&mut terminal)?;
 
             // Wait for one event, then drain whatever else is queued so a
             // burst of output causes one redraw, not hundreds. The timeout
@@ -176,7 +214,98 @@ impl App {
             self.autosave();
         }
         self.finish_session();
+        self.say_goodbye();
         Ok(())
+    }
+
+    /// Draw a frame and send it where it goes.
+    fn render(&mut self, terminal: &mut Terminal) -> Result<()> {
+        if matches!(self.output, Output::Server(None)) {
+            return Ok(()); // nobody is watching
+        }
+        // A changed size makes the draw below resize and repaint everything.
+        terminal.backend_mut().set_size(self.size);
+        if std::mem::take(&mut self.redraw_all) {
+            terminal.clear()?;
+            self.cursor_style = None;
+        }
+        terminal.draw(|f| self.draw(f))?;
+        self.sync_cursor_style(terminal);
+        let frame = terminal.backend_mut().take();
+        match &self.output {
+            Output::Local => {
+                let mut out = stdout();
+                out.write_all(&frame)?;
+                out.flush()?;
+            }
+            Output::Server(Some(client)) => {
+                // A client too slow to keep up misses frames; the next
+                // one it gets repaints everything.
+                if !client.send_output(frame) {
+                    self.redraw_all = true;
+                }
+            }
+            Output::Server(None) => {}
+        }
+        Ok(())
+    }
+
+    // ---- clients (server only) ----------------------------------------
+
+    fn session_name(&self) -> &str {
+        self.saving.as_ref().map_or("", |s| s.name.as_str())
+    }
+
+    fn client_id(&self) -> Option<u64> {
+        match &self.output {
+            Output::Server(Some(c)) => Some(c.id),
+            _ => None,
+        }
+    }
+
+    /// Show the session on a new client, sending any current one away.
+    fn attach(&mut self, client: Client) {
+        let reason = format!("[session '{}' was attached elsewhere]", self.session_name());
+        let Output::Server(current) = &mut self.output else {
+            return;
+        };
+        if let Some(old) = current.take() {
+            old.close(reason);
+        }
+        self.size = client.size;
+        *current = Some(client);
+        self.redraw_all = true;
+        self.mouse_grab = None;
+    }
+
+    fn detach(&mut self) {
+        let name = self.session_name();
+        let reason = format!("[detached from '{name}'; `haunt attach {name}` to come back]");
+        if let Output::Server(current) = &mut self.output
+            && let Some(client) = current.take()
+        {
+            client.close(reason);
+        }
+    }
+
+    /// Tell the attached client why the session is ending, and wait (a
+    /// bounded time) for that to reach it.
+    fn say_goodbye(&mut self) {
+        let name = self.session_name().to_string();
+        let Output::Server(current) = &mut self.output else {
+            return;
+        };
+        let Some(client) = current.take() else {
+            return;
+        };
+        let reason = if self.killed.is_some() {
+            format!("[session '{name}' was killed]")
+        } else if self.tabs.is_empty() {
+            format!("[session '{name}' ended]")
+        } else {
+            format!("[session '{name}' saved and closed; `haunt attach {name}` restores it]")
+        };
+        let _ = client.close(reason).join();
     }
 
     // ---- sessions -----------------------------------------------------
@@ -276,9 +405,10 @@ impl App {
     }
 
     /// On exit: quitting saves the session so it can be resumed; if every
-    /// shell exited instead, the session is over and its file is removed.
+    /// shell exited or it was killed, the session is over and its file is
+    /// removed.
     fn finish_session(&mut self) {
-        if self.tabs.is_empty() {
+        if self.tabs.is_empty() || self.killed.is_some() {
             if let Some(s) = &self.saving {
                 session::delete(&s.path);
             }
@@ -441,12 +571,29 @@ impl App {
             }
             AppEvent::Input(Event::Paste(text)) => self.on_paste(&text),
             AppEvent::Input(Event::Mouse(m)) => self.on_mouse(m),
+            AppEvent::Input(Event::Resize(cols, rows)) => self.size = Size::new(cols, rows),
             AppEvent::Input(_) | AppEvent::PaneOutput => {}
             AppEvent::PaneExited(id) => self.close_pane(id),
             AppEvent::Title(id, title) => {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.title = title;
                 }
+            }
+            AppEvent::Attach(client) => self.attach(client),
+            // Ignore stragglers from a client that was already replaced.
+            AppEvent::ClientInput(id, ev) if self.client_id() == Some(id) => {
+                self.handle(AppEvent::Input(ev))
+            }
+            AppEvent::ClientInput(..) => {}
+            AppEvent::ClientGone(id) => {
+                if self.client_id() == Some(id) {
+                    self.output = Output::Server(None);
+                    self.mouse_grab = None;
+                }
+            }
+            AppEvent::Kill(stream) => {
+                self.killed = Some(stream);
+                self.quit = true;
             }
         }
     }
@@ -684,6 +831,10 @@ impl App {
                 let panes = tab.layout.panes();
                 let current = panes.iter().position(|&p| p == tab.focused).unwrap_or(0);
                 tab.focused = panes[cycle(current, delta, panes.len())];
+                Ok(())
+            }
+            Action::Detach => {
+                self.detach();
                 Ok(())
             }
             Action::Quit => {

@@ -5,10 +5,11 @@ tabs as a tree in a sidebar on the left, with each tab's panes listed under it.
 
 ![haunt demo](docs/demo.gif)
 
-haunt is deliberately simple: there's no config file, no themes, and no
-detach/attach. Everything is a constant in the source, so change the code if
-you want different behavior. It can save named sessions, so your tabs and
-their text survive a restart or a crash.
+haunt is deliberately simple: there's no config file and no themes.
+Everything is a constant in the source, so change the code if you want
+different behavior. Named sessions keep running in the background like
+`screen` or `tmux`, so you can close the terminal and pick up where you left
+off, and they're saved to disk so they survive a reboot or a crash too.
 
 ## Features
 
@@ -22,8 +23,10 @@ their text survive a restart or a crash.
 - **Mouse support.** Click tabs and panes in the sidebar, click a pane to
   focus it, and scroll over any pane.
 - **Single-chord shortcuts** (Ctrl+Shift+…), with no prefix key to press first.
-- **Optional saved sessions.** `haunt -s work` brings back your tabs, splits,
-  folders and pane text after you quit, or after a crash.
+- **Detachable sessions.** `haunt attach work` keeps your shells running in
+  the background; close the terminal and attach again from any other one.
+- **Saved sessions.** A session's tabs, splits, folders and text are saved
+  as it runs, so they come back after a reboot or a crash.
 - **Always restores your terminal** on exit, even if haunt crashes.
 
 ## Requirements
@@ -75,7 +78,8 @@ at any time to see all the shortcuts.
 | `Ctrl+Shift+S`   | focus the sidebar (press again to leave)         |
 | `Ctrl+Shift+B`   | hide / show the sidebar                          |
 | `Ctrl+Shift+H`   | show the shortcuts popup                         |
-| `Ctrl+Shift+Q`   | quit                                             |
+| `Ctrl+Shift+D`   | detach from a session, leaving it running        |
+| `Ctrl+Shift+Q`   | quit (a session is saved first)                  |
 
 **In the sidebar:** `j`/`k` or the arrow keys move, `Enter` switches to the
 selected tab or pane, `Space` folds or unfolds a tab, and `Esc` returns to
@@ -100,35 +104,45 @@ in `src/input.rs`.
 
 ## Sessions
 
-Start haunt with a session name to have it saved:
+Plain `haunt` lives and dies with its terminal. For anything you want to
+keep, use a named session:
 
 ```sh
-haunt -s work      # restore "work" if it was saved, and keep saving it
-haunt --sessions   # list saved sessions
-haunt              # no session: nothing is saved
+haunt attach work    # show session "work", starting it if needed (short: haunt a work)
+haunt ls             # list running and saved sessions
+haunt kill work      # stop "work" and delete its saved copy
 ```
 
-While a session is open, haunt saves it every 3 seconds while anything
-changes, so a crash or power loss costs at most a few seconds. The sidebar
-shows `[work]` at the bottom.
+A session runs in a background server, so your shells and the programs in
+them (builds, servers, `claude`) keep running when you:
+- press `Ctrl+Shift+D` to detach, or
+- close the terminal window.
 
-When you start the session again, you get back:
+Run `haunt attach work` from any terminal to get it back, including over
+`ssh`. A session shows in one terminal at a time: attaching from a second
+one takes it over from the first. The sidebar shows `[work]` at the bottom.
+
+While it runs, a session is also saved to disk every few seconds. If the
+server stops (reboot, crash, or `Ctrl+Shift+Q`), the next
+`haunt attach work` brings back:
 - every tab, with its name, splits and folded state
 - each pane's text and scrollback, with colors, followed by a `── restored ──` line
 - a fresh shell in each pane, in the folder it was in
 
-Programs that were running, such as vim or a server, aren't restarted; only
-their text is kept. If vim or another full-screen program was open, you get
-back the shell text from before it started.
+Programs that were running aren't restarted after that; only their text is
+kept. If vim or another full-screen program was open, you get back the
+shell text from before it started.
 
-- `Ctrl+Shift+Q` quits and keeps the session for next time.
+- `Ctrl+Shift+D` detaches; the session keeps running.
+- `Ctrl+Shift+Q` stops the session and keeps the saved copy for next time.
 - Exiting every shell (typing `exit` in the last pane) ends the session and
   deletes it.
-- A session can only be open in one haunt at a time.
 
-Sessions are stored in `~/.local/state/haunt/sessions/` (or
-`$XDG_STATE_HOME/haunt/sessions/`), one `NAME.json` file each. To delete one,
-remove its file.
+Saved sessions are in `~/.local/state/haunt/sessions/` (or
+`$XDG_STATE_HOME/haunt/sessions/`). If a session fails to start, its error
+is printed, and also kept in `NAME.log` there. Running sessions listen on a
+socket in `/tmp/haunt-UID/` (or `$XDG_RUNTIME_DIR/haunt/`) that only your
+user can use.
 
 ## Customizing
 
@@ -145,9 +159,14 @@ There's no config file. Edit the source and run `./install.sh` again.
 
 ## Code map
 
-- `src/main.rs`: command-line options; sets up the outer terminal and restores it on exit and on panic
-- `src/app.rs`: app state (tabs, panes, modes), the event loop, and session restore and autosave
-- `src/session.rs`: the session file format, saving, listing and locking
+- `src/main.rs`: the `haunt` subcommands
+- `src/app.rs`: app state (tabs, panes, modes), the event loop, session restore and autosave, and the attached client
+- `src/server.rs`: the background server for a session: starting it, the socket, and clients
+- `src/client.rs`: `haunt attach` and `haunt kill`
+- `src/protocol.rs`: the messages between client and server
+- `src/screen.rs`: a ratatui backend that draws into a buffer, so frames can go over the socket
+- `src/tty.rs`: sets up the outer terminal and restores it on exit and on panic
+- `src/session.rs`: the session file format, saving, listing, locking and file locations
 - `src/snapshot.rs`: turns a pane's text into colored text for saving
 - `src/layout.rs`: the split tree and pane rectangles
 - `src/pane.rs`: one PTY, shell and alacritty_terminal emulator per pane
@@ -158,7 +177,8 @@ There's no config file. Edit the source and run `./install.sh` again.
 - `src/ui/mod.rs`: splits the screen and draws pane dividers
 
 Run `cargo test` for the unit tests, which cover layout math, the sidebar
-tree and selection, key/mouse encoding, and saving/restoring sessions.
+tree and selection, key/mouse encoding, saving/restoring sessions, and the
+client/server messages.
 
 ## Known limitations
 
@@ -169,7 +189,11 @@ tree and selection, key/mouse encoding, and saving/restoring sessions.
   don't set one show "shell".
 - No copy mode. Use your terminal's Shift+drag selection.
 - Clipboard writes from programs (OSC 52) aren't passed to the outer terminal.
-- Restored sessions bring back text, not running programs.
+- After a reboot, crash or quit, sessions bring back text, not running
+  programs. Detaching keeps programs running.
+- After installing a new version, a session that's already running keeps
+  the old code until it's stopped (`Ctrl+Shift+Q`, then attach again).
+- A session shows in one terminal at a time.
 
 ## Built with
 
